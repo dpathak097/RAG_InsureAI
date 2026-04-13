@@ -39,7 +39,7 @@ logger = logging.getLogger(__name__)
 # ── Configuration ──────────────────────────────────────────────────────────────
 RETRIEVE_K = 12
 RERANK_K = 6
-MAX_CONTEXT_CHARS = 3000
+MAX_CONTEXT_CHARS = 6000
 SUMMARY_MAX_CHARS = 20000
 
 # ══════════════════════════════════════════════════════════════════════════════

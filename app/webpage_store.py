@@ -108,20 +108,36 @@ class WebpageVectorStore:
                 urls.add(meta["source_url"])
         return sorted(urls)
 
-    def search(self, query: str, top_k: int = 5, filter_metadata: Optional[Dict] = None) -> List[Document]:
-        if self.collection.count() == 0:
+    def search(
+        self,
+        query: str,
+        top_k: int = 5,
+        filter_metadata: Optional[Dict] = None,
+        use_hybrid: bool = True,
+        use_reranker: bool = False
+    ) -> List[Document]:
+        count = self.collection.count()
+        if count == 0:
             return []
-        dense = self._dense_search(query, 2*top_k, filter_metadata)
-        bm25 = self._bm25_search(query, top_k)
-        merged = {}
-        for doc_id, text, meta, score in dense + bm25:
-            if doc_id not in merged:
-                merged[doc_id] = (doc_id, text, meta, score)
-        candidates = list(merged.values())
-        if len(candidates) > 1:
+
+        safe_k = min(2 * top_k, count)
+        dense = self._dense_search(query, safe_k, filter_metadata)
+        
+        if use_hybrid:
+            bm25 = self._bm25_search(query, top_k)
+            merged = {}
+            for doc_id, text, meta, score in dense + bm25:
+                if doc_id not in merged:
+                    merged[doc_id] = (doc_id, text, meta, score)
+            candidates = list(merged.values())
+        else:
+            candidates = dense
+        
+        if use_reranker and len(candidates) > 1:
             candidates = self._rerank(query, candidates, top_k)
         else:
             candidates = candidates[:top_k]
+        
         docs = []
         for doc_id, text, meta, orig_score in candidates:
             doc = Document(page_content=text, metadata=dict(meta))

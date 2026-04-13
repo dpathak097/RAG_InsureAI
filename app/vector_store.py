@@ -207,10 +207,12 @@ class ChromaVectorStore:
         use_hybrid: bool = True,
         use_reranker: bool = False,
     ) -> List[Document]:
-        if self.collection.count() == 0:
+        count = self.collection.count()
+        if count == 0:
             return []
 
-        dense_candidates = self._dense_search(query, k=2*top_k, filter_meta=filter_metadata)
+        safe_k = min(2 * top_k, count)
+        dense_candidates = self._dense_search(query, k=safe_k, filter_meta=filter_metadata)
 
         if use_hybrid:
             bm25_candidates = self._bm25_search(query, k=top_k)

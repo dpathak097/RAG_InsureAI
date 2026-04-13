@@ -1,10 +1,11 @@
 """
 FastAPI REST API — bridges the React/Lovable UI to the RAG pipeline.
 Endpoints:
-  POST   /upload            — async ingest (returns job_id immediately)
+  POST   /upload            — async ingest document (returns job_id immediately)
   GET    /upload/{job_id}   — poll job status
-  POST   /ask               — non‑streaming (documents only)
-  POST   /ask-stream        — streaming (documents only)
+  POST   /ask               — UNIFIED: answer from documents + videos + webpages
+  POST   /ask-documents-only— original (documents only) – for backward compatibility
+  POST   /ask-stream        — streaming (documents only – kept unchanged)
   POST   /ask-url           — streaming URL question (fast, standalone)
   POST   /transcribe        — transcribe audio via Whisper
   GET    /docs              — list knowledge base documents
@@ -12,14 +13,13 @@ Endpoints:
   DELETE /docs              — clear all documents
   GET    /health            — health check
 
-  🆕 NEW endpoints for videos & webpages:
+  🆕 endpoints for videos & webpages:
   POST   /upload-video      — store YouTube video transcript permanently
   POST   /upload-webpage    — store webpage content permanently
   GET    /videos            — list stored video URLs
   DELETE /videos/{url}      — remove video
   GET    /webpages          — list stored webpage URLs
   DELETE /webpages/{url}    — remove webpage
-  POST   /ask-comprehensive — answer from documents + videos + webpages
 """
 import asyncio
 import logging
@@ -163,7 +163,6 @@ async def upload_video(req: URLRequest):
     if multi.video_exists(url):
         return {"status": "already_exists", "url": url, "message": "Video already in knowledge base."}
     try:
-        # Fetch transcript
         docs = await asyncio.to_thread(_load_youtube, url)
         if not docs or not docs[0].page_content.strip():
             raise HTTPException(status_code=400, detail="Could not extract transcript from this YouTube video.")
@@ -186,7 +185,6 @@ async def upload_webpage(req: URLRequest):
     if multi.webpage_exists(url):
         return {"status": "already_exists", "url": url, "message": "Webpage already in knowledge base."}
     try:
-        # Use advanced loader
         docs = await asyncio.to_thread(load_url_advanced, url)
         if not docs or len(docs[0].page_content.strip()) < 200:
             raise HTTPException(status_code=400, detail="Could not extract meaningful content from this URL.")
@@ -231,21 +229,47 @@ async def delete_webpage(url: str):
     multi.delete_webpage(url)
     return {"removed": True, "url": url}
 
-# ── Unified ask endpoint (documents + videos + webpages) ─────────────────────
-class AskComprehensiveRequest(BaseModel):
-    question: str
-
-@app.post("/ask-comprehensive")
-async def ask_comprehensive(req: AskComprehensiveRequest):
+# ══════════════════════════════════════════════════════════════════════════════
+# UNIFIED ASK (documents + videos + webpages) – MAIN ENDPOINT FOR UI
+# ══════════════════════════════════════════════════════════════════════════════
+@app.post("/ask")
+async def ask(req: AskRequest):
+    """
+    UNIFIED answer from all sources: documents, videos, and webpages.
+    This is the primary endpoint your UI should call.
+    """
     if not req.question.strip():
         raise HTTPException(status_code=400, detail="Question cannot be empty.")
     try:
-        # ✅ FIX: Directly await the async method, do NOT wrap in asyncio.to_thread
         answer, sources = await _get_multi_rag().ask(req.question)
         return {"answer": answer, "sources": sources}
     except Exception as exc:
-        logger.exception("Comprehensive ask failed")
+        logger.exception("Unified ask failed")
         raise HTTPException(status_code=500, detail=str(exc))
+
+# ── Original document‑only ask (backward compatibility) ──────────────────────
+@app.post("/ask-documents-only")
+async def ask_documents_only(req: AskRequest):
+    """
+    Legacy endpoint: answers only from uploaded documents (no videos/webpages).
+    """
+    if not req.question.strip():
+        raise HTTPException(status_code=400, detail="Question cannot be empty.")
+    try:
+        answer, _, _ = await asyncio.wait_for(
+            asyncio.to_thread(_get_pipeline().knowledge_query, req.question),
+            timeout=150,
+        )
+        return {"answer": answer}
+    except asyncio.TimeoutError:
+        raise HTTPException(status_code=504, detail="The AI model server is taking too long to respond. Please try again in a moment.")
+    except (APIConnectionError, APITimeoutError, APIStatusError) as exc:
+        logger.warning("Ask failed due to upstream model error: %s", exc)
+        status_code, detail = _describe_llm_failure(exc)
+        raise HTTPException(status_code=status_code, detail=detail) from exc
+    except Exception as exc:
+        logger.exception("Ask failed unexpectedly")
+        raise HTTPException(status_code=500, detail=f"The backend failed while generating the answer: {exc}") from exc
 
 # ══════════════════════════════════════════════════════════════════════════════
 # ALL ORIGINAL ENDPOINTS REMAIN UNCHANGED BELOW
@@ -374,28 +398,7 @@ async def ask_url(req: AskURLRequest):
 
     return StreamingResponse(generate(), media_type="text/event-stream")
 
-# ── Ask (standard RAG, non‑streaming) ────────────────────────────────────────
-@app.post("/ask")
-async def ask(req: AskRequest):
-    if not req.question.strip():
-        raise HTTPException(status_code=400, detail="Question cannot be empty.")
-    try:
-        answer, _, _ = await asyncio.wait_for(
-            asyncio.to_thread(_get_pipeline().knowledge_query, req.question),
-            timeout=150,
-        )
-        return {"answer": answer}
-    except asyncio.TimeoutError:
-        raise HTTPException(status_code=504, detail="The AI model server is taking too long to respond. Please try again in a moment.")
-    except (APIConnectionError, APITimeoutError, APIStatusError) as exc:
-        logger.warning("Ask failed due to upstream model error: %s", exc)
-        status_code, detail = _describe_llm_failure(exc)
-        raise HTTPException(status_code=status_code, detail=detail) from exc
-    except Exception as exc:
-        logger.exception("Ask failed unexpectedly")
-        raise HTTPException(status_code=500, detail=f"The backend failed while generating the answer: {exc}") from exc
-
-# ── Streaming ask endpoint ───────────────────────────────────────────────
+# ── Streaming ask endpoint (documents only, unchanged) ────────────────────────
 @app.post("/ask-stream")
 async def ask_stream(req: AskRequest):
     if not req.question.strip():

@@ -19,7 +19,7 @@ class MultiSourceRAG:
         self.doc_pipeline = RAGPipeline()   # untouched
         self.video_store = VideoVectorStore()
         self.webpage_store = WebpageVectorStore()
-        self.max_context_chars = 3000
+        self.max_context_chars = 6000   # Increased from 3000
 
     def _merge_chunks(self, chunks: List[Document]) -> List[Document]:
         """Deduplicate by content hash and keep highest similarity."""
@@ -35,18 +35,33 @@ class MultiSourceRAG:
         Search all three sources, combine context, and generate answer with citations.
         Returns (answer, list_of_sources).
         """
-        # 1. Get chunks from all three stores
-        doc_chunks = await asyncio.to_thread(self.doc_pipeline._vector_store.search, question, top_k=5)
-        video_chunks = await asyncio.to_thread(self.video_store.search, question, top_k=4)
-        webpage_chunks = await asyncio.to_thread(self.webpage_store.search, question, top_k=4)
+        # 1. Get chunks from all three stores with hybrid search + reranker
+        doc_chunks = await asyncio.to_thread(
+            self.doc_pipeline._vector_store.search, 
+            question, top_k=6, use_hybrid=True, use_reranker=True
+        )
+        video_chunks = await asyncio.to_thread(
+            self.video_store.search, question, top_k=4, use_hybrid=True, use_reranker=True
+        )
+        webpage_chunks = await asyncio.to_thread(
+            self.webpage_store.search, question, top_k=4, use_hybrid=True, use_reranker=True
+        )
 
         all_chunks = self._merge_chunks(doc_chunks + video_chunks + webpage_chunks)
-        # keep top 12 after merging
         all_chunks.sort(key=lambda x: x.metadata.get("similarity", 0), reverse=True)
         all_chunks = all_chunks[:12]
 
         if not all_chunks:
-            return "No relevant information found in any source (documents, videos, or webpages).", []
+            # No relevant chunks in uploaded sources — answer from general knowledge with clear label
+            llm = get_insurance_llm(temperature=0.3)
+            prompt = (
+                "You are a helpful insurance assistant. Answer the question below using your general knowledge. "
+                "Be concise and helpful.\n\n"
+                f"Question: {question}\n\nAnswer:"
+            )
+            response = await asyncio.to_thread(llm.invoke, prompt)
+            answer = response.content if hasattr(response, "content") else str(response)
+            return f"*(No matching content found in uploaded sources — answering from general knowledge)*\n\n{answer}", []
 
         # 2. Build context with source type annotation
         context_parts = []
@@ -71,33 +86,27 @@ class MultiSourceRAG:
         if len(full_context) > self.max_context_chars:
             full_context = full_context[:self.max_context_chars] + "... (truncated)"
 
-        # 3. Prompt with citation requirement
-        prompt = f"""You are an Insurance Policy Analyst. Answer based ONLY on the CONTEXT below.
-CONTEXT may come from documents, video transcripts, or webpages.
-
-RULES (strict):
-- For every fact, number, condition, or limit, cite the exact source as shown in brackets: [Document: name, Page X] or [Video: URL] or [Webpage: URL].
-- If information is not found, say "Not mentioned in any source."
-- Do not invent anything.
-- Use markdown: headings, bullet points, bold for key numbers.
-- If calculation is needed, show step‑by‑step using only numbers from context.
+        # 3. Prompt: answer from context, fall back to general knowledge if context is insufficient
+        prompt = f"""You are a helpful insurance assistant. Use the CONTEXT below to answer the QUESTION.
+The context comes from uploaded insurance documents, video transcripts, and webpages.
 
 CONTEXT:
 {full_context}
 
 QUESTION: {question}
 
-ANSWER (with citations):"""
+Instructions:
+- Answer clearly and helpfully using the context above.
+- Use bullet points where helpful.
+- If the context contains partial information, use it and supplement with general knowledge — clearly marking any general knowledge with "(general knowledge)".
+- Only if the context has NO relevant information at all, answer from general knowledge and start your answer with: "*(Answering from general knowledge — not found in uploaded sources)*"
+
+ANSWER:"""
 
         llm = get_insurance_llm(temperature=0)
         response = await asyncio.to_thread(llm.invoke, prompt)
         answer = response.content if hasattr(response, "content") else str(response)
 
-        # Post‑process warning if no citations
-        if "[Document:" not in answer and "[Video:" not in answer and "[Webpage:" not in answer and "Not mentioned" not in answer:
-            answer += "\n\n⚠️ **Warning:** Answer lacks explicit citations. Verify against original sources."
-
-        # Deduplicate sources
         unique_sources = list(dict.fromkeys(sources))
         return answer, unique_sources
 

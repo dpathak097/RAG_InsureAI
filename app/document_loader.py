@@ -53,19 +53,42 @@ def _get_youtube_transcript_with_whisper_fallback(url: str) -> tuple[str, dict]:
         return "Invalid YouTube URL format.", {"error": "invalid_url"}
     video_id = match.group(1)
     
-    # Step 1: Try to get existing transcript using new v1.2.x API
+    # Step 1: Try to get existing transcript in ANY language
     try:
-        api = YouTubeTranscriptApi()
-        fetched = api.fetch(video_id)
-        transcript_text = " ".join(s.text for s in fetched.snippets)
-        language_code = fetched.language_code
-        is_generated = fetched.is_generated
-        source_type = "youtube_auto" if is_generated else "youtube_manual"
-        logger.info(f"Using transcript ({source_type}) in {language_code} for {video_id}")
-        return transcript_text, {"source_type": source_type, "language": language_code}
-
+        # Get list of all available transcripts
+        transcript_list = YouTubeTranscriptApi.list_transcripts(video_id)
+        
+        # Try manual transcript first (higher quality)
+        try:
+            transcript = transcript_list.find_manually_created_transcript()
+            transcript_text = " ".join(entry["text"] for entry in transcript.fetch())
+            language_code = transcript.language_code
+            logger.info(f"Using manual transcript in {language_code} for {video_id}")
+            return transcript_text, {"source_type": "youtube_manual", "language": language_code}
+        except:
+            pass
+        
+        # Fallback to auto-generated
+        try:
+            transcript = transcript_list.find_generated_transcript()
+            transcript_text = " ".join(entry["text"] for entry in transcript.fetch())
+            language_code = transcript.language_code
+            logger.info(f"Using auto-generated transcript in {language_code} for {video_id}")
+            return transcript_text, {"source_type": "youtube_auto", "language": language_code}
+        except:
+            pass
+        
+        # Any available transcript
+        for transcript in transcript_list:
+            transcript_text = " ".join(entry["text"] for entry in transcript.fetch())
+            logger.info(f"Using fallback transcript in {transcript.language_code} for {video_id}")
+            return transcript_text, {"source_type": "youtube_fallback", "language": transcript.language_code}
+            
+    except (NoTranscriptFound, TranscriptsDisabled) as e:
+        logger.info(f"No transcript available for {video_id}, falling back to Whisper transcription.")
+        return _transcribe_youtube_audio(url, video_id)
     except Exception as e:
-        logger.warning(f"Transcript fetch failed for {video_id}: {e}. Falling back to Whisper.")
+        logger.warning(f"Unexpected error getting transcript: {e}")
         return _transcribe_youtube_audio(url, video_id)
 
 
@@ -79,10 +102,11 @@ def _transcribe_youtube_audio(url: str, video_id: str) -> tuple[str, dict]:
     
     temp_audio_path = None
     try:
-        # Download audio using yt-dlp
+        # Create temp file for audio
         with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as tmp:
             temp_audio_path = tmp.name
         
+        # yt-dlp options
         ydl_opts = {
             'format': 'bestaudio/best',
             'postprocessors': [{
@@ -99,10 +123,9 @@ def _transcribe_youtube_audio(url: str, video_id: str) -> tuple[str, dict]:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             ydl.download([url])
         
-        # The actual file may have a different extension after processing
+        # Find the actual mp3 file (yt-dlp may add extra suffix)
         actual_path = temp_audio_path.replace('.mp3', '.mp3')
         if not os.path.exists(actual_path):
-            # Find any mp3 file in the temp directory
             import glob
             mp3_files = glob.glob(temp_audio_path.replace('.mp3', '') + "*.mp3")
             if mp3_files:
@@ -110,10 +133,10 @@ def _transcribe_youtube_audio(url: str, video_id: str) -> tuple[str, dict]:
             else:
                 raise Exception("Could not find downloaded audio file")
         
-        # Load Whisper model (lazy load, cached after first use)
+        # Load Whisper model
         whisper_model = _get_whisper_model()
         
-        # Transcribe with automatic language detection
+        # Transcribe
         logger.info(f"Transcribing audio with Whisper (auto language detection)...")
         result = whisper_model.transcribe(actual_path, task="transcribe")
         
@@ -130,17 +153,16 @@ def _transcribe_youtube_audio(url: str, video_id: str) -> tuple[str, dict]:
         logger.error(f"Whisper transcription failed: {e}")
         return f"Could not transcribe audio: {str(e)}", {"error": str(e)}
     finally:
-        # Cleanup temp audio file
+        # Cleanup
         if temp_audio_path and os.path.exists(temp_audio_path):
             os.unlink(temp_audio_path)
-        # Also cleanup any other temp files from yt-dlp
         for ext in ['.mp3', '.temp', '.part']:
             path = temp_audio_path.replace('.mp3', '') + ext if temp_audio_path else None
             if path and os.path.exists(path):
                 os.unlink(path)
 
 
-# Global Whisper model (lazy loaded, cached)
+# Global Whisper model
 _whisper_model = None
 _whisper_lock = None
 
