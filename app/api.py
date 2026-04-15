@@ -3,7 +3,7 @@ FastAPI REST API — bridges the React/Lovable UI to the RAG pipeline.
 Endpoints:
   POST   /upload            — async ingest document (returns job_id immediately)
   GET    /upload/{job_id}   — poll job status
-  POST   /ask               — UNIFIED: answer from documents + videos + webpages
+  POST   /ask               — UNIFIED: answer from documents + videos + webpages (with memory)
   POST   /ask-documents-only— original (documents only) – for backward compatibility
   POST   /ask-stream        — streaming (documents only – kept unchanged)
   POST   /ask-url           — streaming URL question (fast, standalone)
@@ -12,14 +12,13 @@ Endpoints:
   DELETE /docs/{name}       — remove a specific document
   DELETE /docs              — clear all documents
   GET    /health            — health check
-
-  🆕 endpoints for videos & webpages:
-  POST   /upload-video      — store YouTube video transcript permanently
+  POST   /upload-video      — store any video transcript permanently
   POST   /upload-webpage    — store webpage content permanently
   GET    /videos            — list stored video URLs
   DELETE /videos/{url}      — remove video
   GET    /webpages          — list stored webpage URLs
   DELETE /webpages/{url}    — remove webpage
+  DELETE /conversation/{session_id} — clear conversation history
 """
 import asyncio
 import logging
@@ -45,6 +44,10 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 _JOB_TTL = 3600  # seconds — jobs older than this are pruned from memory
+
+# Conversation memory: session_id -> list of {"role": "user/assistant", "content": "..."}
+_conversations: dict[str, list[dict]] = {}
+_MAX_HISTORY_TURNS = 10  # keep last 10 exchanges
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -124,12 +127,13 @@ def _ingest_file(tmp_path: str, filename: str) -> int:
 
 class AskRequest(BaseModel):
     question: str
+    session_id: str = "default"  # optional — frontend can omit it
 
 class URLRequest(BaseModel):
     url: str
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 🆕 MultiSourceRAG, VideoStore, WebpageStore
+# MultiSourceRAG, VideoStore, WebpageStore
 # ══════════════════════════════════════════════════════════════════════════════
 from multi_source_rag import MultiSourceRAG
 from document_loader import load_url_advanced, is_youtube_url, _load_youtube
@@ -143,7 +147,6 @@ def _get_multi_rag() -> MultiSourceRAG:
     return _multi_rag
 
 def _chunk_transcript(transcript_text: str, url: str, title: str = "") -> list:
-    """Chunk transcript for video storage."""
     from langchain_core.documents import Document
     chunker = SectionChunker(chunk_size=600, chunk_overlap=80)
     doc = Document(page_content=transcript_text, metadata={"source_url": url, "title": title, "type": "video_transcript"})
@@ -153,19 +156,18 @@ def _chunk_transcript(transcript_text: str, url: str, title: str = "") -> list:
         chunk.metadata["source_url"] = url
     return chunks
 
-# ── Upload Video (YouTube) ───────────────────────────────────────────────────
+# ── Upload Video (any video URL) ───────────────────────────────────────────────────
 @app.post("/upload-video")
 async def upload_video(req: URLRequest):
     url = req.url.strip()
-    if not is_youtube_url(url):
-        raise HTTPException(status_code=400, detail="Only YouTube URLs are supported for video ingestion.")
     multi = _get_multi_rag()
     if multi.video_exists(url):
         return {"status": "already_exists", "url": url, "message": "Video already in knowledge base."}
     try:
-        docs = await asyncio.to_thread(_load_youtube, url)
+        from document_loader import load_url
+        docs = await asyncio.to_thread(load_url, url)
         if not docs or not docs[0].page_content.strip():
-            raise HTTPException(status_code=400, detail="Could not extract transcript from this YouTube video.")
+            raise HTTPException(status_code=400, detail="Could not extract transcript from this video.")
         transcript_text = docs[0].page_content
         title = docs[0].metadata.get("title", url)
         chunks = _chunk_transcript(transcript_text, url, title)
@@ -230,28 +232,49 @@ async def delete_webpage(url: str):
     return {"removed": True, "url": url}
 
 # ══════════════════════════════════════════════════════════════════════════════
-# UNIFIED ASK (documents + videos + webpages) – MAIN ENDPOINT FOR UI
+# UNIFIED ASK (documents + videos + webpages) – WITH CONVERSATION MEMORY
 # ══════════════════════════════════════════════════════════════════════════════
 @app.post("/ask")
 async def ask(req: AskRequest):
     """
     UNIFIED answer from all sources: documents, videos, and webpages.
-    This is the primary endpoint your UI should call.
+    Supports conversation memory via session_id.
     """
     if not req.question.strip():
         raise HTTPException(status_code=400, detail="Question cannot be empty.")
+    
+    # Retrieve or create conversation history for this session
+    history_list = _conversations.get(req.session_id, [])
+    # Format history as a string for the prompt
+    history_str = ""
+    for turn in history_list[-_MAX_HISTORY_TURNS * 2:]:  # last N turns
+        history_str += f"{turn['role'].capitalize()}: {turn['content']}\n"
+    
     try:
-        answer, sources = await _get_multi_rag().ask(req.question)
+        answer, sources = await _get_multi_rag().ask(req.question, history=history_str)
+        
+        # Update conversation memory
+        history_list.append({"role": "user", "content": req.question})
+        history_list.append({"role": "assistant", "content": answer})
+        _conversations[req.session_id] = history_list[-_MAX_HISTORY_TURNS * 2:]  # keep only recent
+        
         return {"answer": answer, "sources": sources}
     except Exception as exc:
         logger.exception("Unified ask failed")
         raise HTTPException(status_code=500, detail=str(exc))
+
+@app.delete("/conversation/{session_id}")
+async def clear_conversation(session_id: str):
+    if session_id in _conversations:
+        del _conversations[session_id]
+    return {"status": "cleared"}
 
 # ── Original document‑only ask (backward compatibility) ──────────────────────
 @app.post("/ask-documents-only")
 async def ask_documents_only(req: AskRequest):
     """
     Legacy endpoint: answers only from uploaded documents (no videos/webpages).
+    Note: This also requires session_id but does not use history.
     """
     if not req.question.strip():
         raise HTTPException(status_code=400, detail="Question cannot be empty.")

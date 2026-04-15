@@ -15,3 +15,6 @@ app/video/
 
 # Docker volumes (managed by Docker)
 *.log
+
+# Claude Code internal files
+.claude/

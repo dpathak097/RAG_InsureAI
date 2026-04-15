@@ -1,10 +1,11 @@
 """
-Document loader: PDF, Word, Excel, PowerPoint, CSV, TXT, URLs, YouTube.
-
+Document loader: PDF, Word, Excel, PowerPoint, CSV, TXT, URLs, YouTube, and any video.
 YouTube handling now supports:
   - Any language (English, Hindi, Arabic, etc.)
   - Videos without subtitles (using Whisper AI transcription)
   - Auto-detection of spoken language
+
+Any video URL (Vimeo, Dailymotion, etc.) is also supported via yt-dlp + Whisper.
 """
 import logging
 import re
@@ -47,18 +48,13 @@ def _get_youtube_transcript_with_whisper_fallback(url: str) -> tuple[str, dict]:
     from youtube_transcript_api import YouTubeTranscriptApi
     from youtube_transcript_api._errors import NoTranscriptFound, TranscriptsDisabled
     
-    # Extract video ID
     match = re.search(r'(?:v=|youtu\.be/)([a-zA-Z0-9_-]{11})', url)
     if not match:
         return "Invalid YouTube URL format.", {"error": "invalid_url"}
     video_id = match.group(1)
     
-    # Step 1: Try to get existing transcript in ANY language
     try:
-        # Get list of all available transcripts
         transcript_list = YouTubeTranscriptApi.list_transcripts(video_id)
-        
-        # Try manual transcript first (higher quality)
         try:
             transcript = transcript_list.find_manually_created_transcript()
             transcript_text = " ".join(entry["text"] for entry in transcript.fetch())
@@ -67,8 +63,6 @@ def _get_youtube_transcript_with_whisper_fallback(url: str) -> tuple[str, dict]:
             return transcript_text, {"source_type": "youtube_manual", "language": language_code}
         except:
             pass
-        
-        # Fallback to auto-generated
         try:
             transcript = transcript_list.find_generated_transcript()
             transcript_text = " ".join(entry["text"] for entry in transcript.fetch())
@@ -77,13 +71,10 @@ def _get_youtube_transcript_with_whisper_fallback(url: str) -> tuple[str, dict]:
             return transcript_text, {"source_type": "youtube_auto", "language": language_code}
         except:
             pass
-        
-        # Any available transcript
         for transcript in transcript_list:
             transcript_text = " ".join(entry["text"] for entry in transcript.fetch())
             logger.info(f"Using fallback transcript in {transcript.language_code} for {video_id}")
             return transcript_text, {"source_type": "youtube_fallback", "language": transcript.language_code}
-            
     except (NoTranscriptFound, TranscriptsDisabled) as e:
         logger.info(f"No transcript available for {video_id}, falling back to Whisper transcription.")
         return _transcribe_youtube_audio(url, video_id)
@@ -93,20 +84,14 @@ def _get_youtube_transcript_with_whisper_fallback(url: str) -> tuple[str, dict]:
 
 
 def _transcribe_youtube_audio(url: str, video_id: str) -> tuple[str, dict]:
-    """
-    Download audio from YouTube and transcribe using Whisper.
-    Supports 99+ languages with automatic detection.
-    """
+    """Download audio from YouTube and transcribe using Whisper."""
     import whisper
     import yt_dlp
     
     temp_audio_path = None
     try:
-        # Create temp file for audio
         with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as tmp:
             temp_audio_path = tmp.name
-        
-        # yt-dlp options
         ydl_opts = {
             'format': 'bestaudio/best',
             'postprocessors': [{
@@ -118,12 +103,9 @@ def _transcribe_youtube_audio(url: str, video_id: str) -> tuple[str, dict]:
             'quiet': True,
             'no_warnings': True,
         }
-        
         logger.info(f"Downloading audio from {url}...")
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             ydl.download([url])
-        
-        # Find the actual mp3 file (yt-dlp may add extra suffix)
         actual_path = temp_audio_path.replace('.mp3', '.mp3')
         if not os.path.exists(actual_path):
             import glob
@@ -132,28 +114,18 @@ def _transcribe_youtube_audio(url: str, video_id: str) -> tuple[str, dict]:
                 actual_path = mp3_files[0]
             else:
                 raise Exception("Could not find downloaded audio file")
-        
-        # Load Whisper model
         whisper_model = _get_whisper_model()
-        
-        # Transcribe
-        logger.info(f"Transcribing audio with Whisper (auto language detection)...")
         result = whisper_model.transcribe(actual_path, task="transcribe")
-        
         transcript_text = result["text"].strip()
         detected_language = result["language"]
-        
         if not transcript_text:
             raise Exception("Whisper returned empty transcript")
-        
         logger.info(f"Whisper transcription complete. Detected language: {detected_language}")
         return transcript_text, {"source_type": "whisper_transcription", "language": detected_language}
-        
     except Exception as e:
         logger.error(f"Whisper transcription failed: {e}")
         return f"Could not transcribe audio: {str(e)}", {"error": str(e)}
     finally:
-        # Cleanup
         if temp_audio_path and os.path.exists(temp_audio_path):
             os.unlink(temp_audio_path)
         for ext in ['.mp3', '.temp', '.part']:
@@ -167,12 +139,10 @@ _whisper_model = None
 _whisper_lock = None
 
 def _get_whisper_model():
-    """Lazy load Whisper model (cached after first use)."""
     global _whisper_model, _whisper_lock
     import asyncio
     if _whisper_lock is None:
         _whisper_lock = asyncio.Lock()
-    
     if _whisper_model is None:
         import whisper
         logger.info("Loading Whisper model (base) - first time may take a moment...")
@@ -184,10 +154,8 @@ def _get_whisper_model():
 def _load_youtube(url: str) -> list[Document]:
     """Main entry point for YouTube video processing."""
     transcript_text, metadata = _get_youtube_transcript_with_whisper_fallback(url)
-    
     source_type = metadata.get("source_type", "unknown")
     language = metadata.get("language", "unknown")
-    
     return [Document(
         page_content=f"YouTube Video: {url}\nLanguage: {language}\nTranscript source: {source_type}\n\nTranscript:\n{transcript_text}",
         metadata={
@@ -201,11 +169,86 @@ def _load_youtube(url: str) -> list[Document]:
 
 
 # ------------------------------------------------------------------------------
+# GENERIC VIDEO SUPPORT (any video URL)
+# ------------------------------------------------------------------------------
+def _load_generic_video(url: str) -> list[Document]:
+    """
+    Download audio from any video URL (Vimeo, Dailymotion, etc.) using yt-dlp,
+    transcribe with Whisper, and return Document.
+    """
+    import whisper
+    import yt_dlp
+    import tempfile
+    import os
+    import re
+
+    temp_audio_path = None
+    try:
+        with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as tmp:
+            temp_audio_path = tmp.name
+
+        ydl_opts = {
+            'format': 'bestaudio/best',
+            'postprocessors': [{
+                'key': 'FFmpegExtractAudio',
+                'preferredcodec': 'mp3',
+                'preferredquality': '192',
+            }],
+            'outtmpl': temp_audio_path.replace('.mp3', ''),
+            'quiet': True,
+            'no_warnings': True,
+        }
+        logger.info(f"Downloading audio from generic video URL: {url}")
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            ydl.download([url])
+
+        actual_path = temp_audio_path.replace('.mp3', '.mp3')
+        if not os.path.exists(actual_path):
+            import glob
+            mp3_files = glob.glob(temp_audio_path.replace('.mp3', '') + "*.mp3")
+            if mp3_files:
+                actual_path = mp3_files[0]
+            else:
+                raise Exception("Could not locate downloaded audio file")
+
+        whisper_model = _get_whisper_model()
+        result = whisper_model.transcribe(actual_path, task="transcribe")
+        transcript_text = result["text"].strip()
+        detected_language = result["language"]
+
+        if not transcript_text:
+            raise Exception("Whisper returned empty transcript")
+
+        logger.info(f"Generic video transcribed, language: {detected_language}")
+        return [Document(
+            page_content=f"Video URL: {url}\nLanguage: {detected_language}\nTranscription source: Whisper\n\nTranscript:\n{transcript_text}",
+            metadata={
+                "source": url,
+                "type": "video",
+                "source_type": "generic_video",
+                "language": detected_language,
+            },
+        )]
+    except Exception as e:
+        logger.error(f"Generic video transcription failed for {url}: {e}")
+        return [Document(
+            page_content=f"Could not transcribe video from {url}. Error: {e}",
+            metadata={"source": url, "type": "video", "error": str(e)},
+        )]
+    finally:
+        if temp_audio_path and os.path.exists(temp_audio_path):
+            os.unlink(temp_audio_path)
+        for ext in ['.mp3', '.temp', '.part']:
+            path = temp_audio_path.replace('.mp3', '') + ext if temp_audio_path else None
+            if path and os.path.exists(path):
+                os.unlink(path)
+
+
+# ------------------------------------------------------------------------------
 # WEBPAGE URL EXTRACTION (unchanged from previous version)
 # ------------------------------------------------------------------------------
 def load_url_advanced(url: str) -> list[Document]:
     """Extract clean content from any URL using multiple strategies."""
-    # Strategy 1: Jina Reader API
     try:
         jina_url = f"https://r.jina.ai/{url}"
         headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
@@ -222,7 +265,6 @@ def load_url_advanced(url: str) -> list[Document]:
     except Exception as e:
         logger.warning("Jina Reader failed for %s: %s", url, e)
 
-    # Strategy 2: readability-lxml
     try:
         from readability import Document as ReadabilityDoc
         resp = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=30)
@@ -241,7 +283,6 @@ def load_url_advanced(url: str) -> list[Document]:
     except Exception as e:
         logger.warning("Readability fallback failed: %s", e)
 
-    # Strategy 3: trafilatura + BeautifulSoup
     return _load_webpage(url)
 
 
@@ -296,9 +337,13 @@ def _load_webpage(url: str) -> list[Document]:
 
 
 def load_url(url: str) -> list[Document]:
-    """Main entry point for URL loading."""
+    """Main entry point for URL loading – supports webpages and any video URL."""
     if is_youtube_url(url):
         return _load_youtube(url)
+    # Check if it looks like a video URL (common patterns)
+    video_patterns = [r'(vimeo\.com)', r'(dailymotion\.com)', r'(twitch\.tv)', r'(facebook\.com/watch)', r'(tiktok\.com)']
+    if any(re.search(p, url) for p in video_patterns):
+        return _load_generic_video(url)
     return load_url_advanced(url)
 
 
@@ -308,7 +353,7 @@ def load_url(url: str) -> list[Document]:
 def load_document(file_path: str, original_name: str) -> list[Document]:
     ext = Path(original_name).suffix.lower()
     try:
-        if ext in (".txt",):
+        if ext in (".txt", ".html", ".htm"):
             return _load_text(file_path, original_name)
         if ext == ".eml":
             return _load_eml(file_path, original_name)
@@ -476,7 +521,7 @@ def _load_csv(path: str, name: str) -> list[Document]:
         )]
 
 
-# ── PLAIN TEXT / EML ─────────────────────────────────────────────────────────
+# ── PLAIN TEXT / EML / HTML ─────────────────────────────────────────────────────────
 def _load_text(path: str, name: str) -> list[Document]:
     with open(path, "r", encoding="utf-8", errors="ignore") as f:
         text = f.read()

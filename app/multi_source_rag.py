@@ -1,28 +1,29 @@
 """
-Unified RAG that searches across documents, videos, and webpages.
-Uses the existing RAGPipeline for documents + new stores for videos/webpages.
+Unified RAG with strict grounding – no hallucinations, exact match only.
+Uses a separate calculation prompt for math questions.
 """
 import asyncio
 import logging
-from typing import List, Tuple, Optional
+from typing import List, Tuple
 
 from langchain_core.documents import Document
-from rag import RAGPipeline, _build_structured_context, _sources_from_chunks
+from rag import RAGPipeline
 from router import get_insurance_llm
 from video_store import VideoVectorStore
 from webpage_store import WebpageVectorStore
+from calculator import compute_insurance_benefits, _is_calculation_question
+from prompt_template import STRICT_GROUNDED_PROMPT, CALCULATION_PROMPT
 
 logger = logging.getLogger(__name__)
 
 class MultiSourceRAG:
     def __init__(self):
-        self.doc_pipeline = RAGPipeline()   # untouched
+        self.doc_pipeline = RAGPipeline()
         self.video_store = VideoVectorStore()
         self.webpage_store = WebpageVectorStore()
-        self.max_context_chars = 6000   # Increased from 3000
+        self.max_context_chars = 6000
 
     def _merge_chunks(self, chunks: List[Document]) -> List[Document]:
-        """Deduplicate by content hash and keep highest similarity."""
         seen = {}
         for chunk in chunks:
             h = hash(chunk.page_content[:200])
@@ -30,14 +31,10 @@ class MultiSourceRAG:
                 seen[h] = chunk
         return list(seen.values())
 
-    async def ask(self, question: str) -> Tuple[str, List[str]]:
-        """
-        Search all three sources, combine context, and generate answer with citations.
-        Returns (answer, list_of_sources).
-        """
-        # 1. Get chunks from all three stores with hybrid search + reranker
+    async def ask(self, question: str, history: str = "") -> Tuple[str, List[str]]:
+        # 1. Retrieve from all stores
         doc_chunks = await asyncio.to_thread(
-            self.doc_pipeline._vector_store.search, 
+            self.doc_pipeline._vector_store.search,
             question, top_k=6, use_hybrid=True, use_reranker=True
         )
         video_chunks = await asyncio.to_thread(
@@ -51,19 +48,7 @@ class MultiSourceRAG:
         all_chunks.sort(key=lambda x: x.metadata.get("similarity", 0), reverse=True)
         all_chunks = all_chunks[:12]
 
-        if not all_chunks:
-            # No relevant chunks in uploaded sources — answer from general knowledge with clear label
-            llm = get_insurance_llm(temperature=0.3)
-            prompt = (
-                "You are a helpful insurance assistant. Answer the question below using your general knowledge. "
-                "Be concise and helpful.\n\n"
-                f"Question: {question}\n\nAnswer:"
-            )
-            response = await asyncio.to_thread(llm.invoke, prompt)
-            answer = response.content if hasattr(response, "content") else str(response)
-            return f"*(No matching content found in uploaded sources — answering from general knowledge)*\n\n{answer}", []
-
-        # 2. Build context with source type annotation
+        # 2. Build context with source info
         context_parts = []
         sources = []
         for chunk in all_chunks:
@@ -77,7 +62,7 @@ class MultiSourceRAG:
                 url = chunk.metadata.get("source_url", "Unknown URL")
                 label = f"Video: {url}"
                 sources.append(url)
-            else:  # webpage
+            else:
                 url = chunk.metadata.get("source_url", "Unknown URL")
                 label = f"Webpage: {url}"
                 sources.append(url)
@@ -86,31 +71,33 @@ class MultiSourceRAG:
         if len(full_context) > self.max_context_chars:
             full_context = full_context[:self.max_context_chars] + "... (truncated)"
 
-        # 3. Prompt: answer from context, fall back to general knowledge if context is insufficient
-        prompt = f"""You are a helpful insurance assistant. Use the CONTEXT below to answer the QUESTION.
-The context comes from uploaded insurance documents, video transcripts, and webpages.
+        # 3. Check if this is a calculation question
+        calc_answer, is_calc = compute_insurance_benefits(question, full_context)
+        if is_calc or _is_calculation_question(question):
+            # Use the strict calculation prompt
+            prompt = CALCULATION_PROMPT.format(
+                context=full_context if full_context else "No relevant content found.",
+                history=history,
+                question=question
+            )
+            llm = get_insurance_llm(temperature=0)
+            response = await asyncio.to_thread(llm.invoke, prompt)
+            answer = response.content if hasattr(response, "content") else str(response)
+            return answer, list(dict.fromkeys(sources))
 
-CONTEXT:
-{full_context}
-
-QUESTION: {question}
-
-Instructions:
-- Answer clearly and helpfully using the context above.
-- Use bullet points where helpful.
-- If the context contains partial information, use it and supplement with general knowledge — clearly marking any general knowledge with "(general knowledge)".
-- Only if the context has NO relevant information at all, answer from general knowledge and start your answer with: "*(Answering from general knowledge — not found in uploaded sources)*"
-
-ANSWER:"""
-
-        llm = get_insurance_llm(temperature=0)
+        # 4. For non‑calculation questions: use strict grounded prompt
+        prompt = STRICT_GROUNDED_PROMPT.format(
+            history=history,
+            context=full_context if full_context else "No relevant content found in knowledge base.",
+            question=question
+        )
+        llm = get_insurance_llm(temperature=0)  # zero temperature for determinism
         response = await asyncio.to_thread(llm.invoke, prompt)
         answer = response.content if hasattr(response, "content") else str(response)
 
-        unique_sources = list(dict.fromkeys(sources))
-        return answer, unique_sources
+        return answer, list(dict.fromkeys(sources))
 
-    # Separate methods for managing video/webpage stores
+    # ----- Management methods (unchanged) -----
     def video_exists(self, url: str) -> bool:
         return self.video_store.url_exists(url)
 
