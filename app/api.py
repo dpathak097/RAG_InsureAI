@@ -3,7 +3,7 @@ FastAPI REST API — bridges the React/Lovable UI to the RAG pipeline.
 Endpoints:
   POST   /upload            — async ingest document (returns job_id immediately)
   GET    /upload/{job_id}   — poll job status
-  POST   /ask               — UNIFIED: answer from documents + videos + webpages (with memory)
+  POST   /ask               — UNIFIED: answer from documents + videos + webpages (with memory AND stateful conversation)
   POST   /ask-documents-only— original (documents only) – for backward compatibility
   POST   /ask-stream        — streaming (documents only – kept unchanged)
   POST   /ask-url           — streaming URL question (fast, standalone)
@@ -19,6 +19,7 @@ Endpoints:
   GET    /webpages          — list stored webpage URLs
   DELETE /webpages/{url}    — remove webpage
   DELETE /conversation/{session_id} — clear conversation history
+  POST   /conversation/reset/{session_id} — reset conversational state
 """
 import asyncio
 import logging
@@ -49,10 +50,12 @@ _JOB_TTL = 3600  # seconds — jobs older than this are pruned from memory
 _conversations: dict[str, list[dict]] = {}
 _MAX_HISTORY_TURNS = 10  # keep last 10 exchanges
 
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     asyncio.create_task(_get_whisper())
     yield
+
 
 app = FastAPI(title="InsureAI RAG API", docs_url="/swagger", redoc_url="/redoc", lifespan=lifespan)
 
@@ -65,10 +68,12 @@ app.add_middleware(
 
 # ── Existing imports ──────────────────────────────────────────────────────────
 from rag import RAGPipeline
+
 _pipeline: RAGPipeline | None = None
 
 _jobs: dict[str, dict] = {}
 _ingest_semaphore: asyncio.Semaphore | None = None
+
 
 def _get_ingest_semaphore() -> asyncio.Semaphore:
     global _ingest_semaphore
@@ -76,17 +81,20 @@ def _get_ingest_semaphore() -> asyncio.Semaphore:
         _ingest_semaphore = asyncio.Semaphore(1)
     return _ingest_semaphore
 
+
 def _get_pipeline() -> RAGPipeline:
     global _pipeline
     if _pipeline is None:
         _pipeline = RAGPipeline()
     return _pipeline
 
+
 def _job_state(status: str, filename: str, chunks: int = 0, error: str | None = None) -> dict:
     job = {"status": status, "filename": filename, "chunks": chunks, "_ts": time.time()}
     if error:
         job["error"] = error
     return job
+
 
 def _prune_jobs() -> None:
     cutoff = time.time() - _JOB_TTL
@@ -96,8 +104,10 @@ def _prune_jobs() -> None:
     if stale:
         logger.info("Pruned %d stale jobs from _jobs cache.", len(stale))
 
+
 def _describe_llm_failure(exc: Exception) -> tuple[int, str]:
     from router import get_active_model_info
+
     model_info = get_active_model_info()
     backend = model_info["backend"]
     model = model_info["model"]
@@ -110,9 +120,11 @@ def _describe_llm_failure(exc: Exception) -> tuple[int, str]:
         return 502, f"The AI model server at {backend} returned HTTP {status_code} while using {model}."
     return 500, "The backend could not generate an answer due to an unexpected internal error."
 
+
 def _ingest_file(tmp_path: str, filename: str) -> int:
     from document_loader import load_document
     from metadata_tagger import tag_document
+
     pipeline = _get_pipeline()
     raw_docs = load_document(tmp_path, filename)
     chunks = pipeline._chunker.split_documents(raw_docs)
@@ -125,12 +137,15 @@ def _ingest_file(tmp_path: str, filename: str) -> int:
     pipeline._vector_store.add_documents(chunks)
     return len(chunks)
 
+
 class AskRequest(BaseModel):
     question: str
     session_id: str = "default"  # optional — frontend can omit it
 
+
 class URLRequest(BaseModel):
     url: str
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # MultiSourceRAG, VideoStore, WebpageStore
@@ -140,21 +155,29 @@ from document_loader import load_url_advanced, is_youtube_url, _load_youtube
 from rag import SectionChunker
 
 _multi_rag: MultiSourceRAG | None = None
+
+
 def _get_multi_rag() -> MultiSourceRAG:
     global _multi_rag
     if _multi_rag is None:
         _multi_rag = MultiSourceRAG()
     return _multi_rag
 
+
 def _chunk_transcript(transcript_text: str, url: str, title: str = "") -> list:
     from langchain_core.documents import Document
+
     chunker = SectionChunker(chunk_size=600, chunk_overlap=80)
-    doc = Document(page_content=transcript_text, metadata={"source_url": url, "title": title, "type": "video_transcript"})
+    doc = Document(
+        page_content=transcript_text,
+        metadata={"source_url": url, "title": title, "type": "video_transcript"},
+    )
     chunks = chunker.split_documents([doc])
     for chunk in chunks:
         chunk.metadata["source_type"] = "video"
         chunk.metadata["source_url"] = url
     return chunks
+
 
 # ── Upload Video (any video URL) ───────────────────────────────────────────────────
 @app.post("/upload-video")
@@ -165,6 +188,7 @@ async def upload_video(req: URLRequest):
         return {"status": "already_exists", "url": url, "message": "Video already in knowledge base."}
     try:
         from document_loader import load_url
+
         docs = await asyncio.to_thread(load_url, url)
         if not docs or not docs[0].page_content.strip():
             raise HTTPException(status_code=400, detail="Could not extract transcript from this video.")
@@ -176,6 +200,7 @@ async def upload_video(req: URLRequest):
     except Exception as exc:
         logger.exception("Video upload failed")
         raise HTTPException(status_code=500, detail=f"Video ingestion failed: {exc}")
+
 
 # ── Upload Webpage (permanent) ───────────────────────────────────────────────
 @app.post("/upload-webpage")
@@ -201,11 +226,13 @@ async def upload_webpage(req: URLRequest):
         logger.exception("Webpage upload failed")
         raise HTTPException(status_code=500, detail=f"Webpage ingestion failed: {exc}")
 
+
 # ── List videos ──────────────────────────────────────────────────────────────
 @app.get("/videos")
 async def list_videos():
     multi = _get_multi_rag()
     return {"videos": multi.list_videos()}
+
 
 # ── Delete video ─────────────────────────────────────────────────────────────
 @app.delete("/videos/{url:path}")
@@ -216,11 +243,13 @@ async def delete_video(url: str):
     multi.delete_video(url)
     return {"removed": True, "url": url}
 
+
 # ── List webpages ────────────────────────────────────────────────────────────
 @app.get("/webpages")
 async def list_webpages():
     multi = _get_multi_rag()
     return {"webpages": multi.list_webpages()}
+
 
 # ── Delete webpage ───────────────────────────────────────────────────────────
 @app.delete("/webpages/{url:path}")
@@ -231,43 +260,83 @@ async def delete_webpage(url: str):
     multi.delete_webpage(url)
     return {"removed": True, "url": url}
 
+
 # ══════════════════════════════════════════════════════════════════════════════
-# UNIFIED ASK (documents + videos + webpages) – WITH CONVERSATION MEMORY
+# Conversation Agent (new)
+# ══════════════════════════════════════════════════════════════════════════════
+from conversation_agent import ConversationAgent
+
+_conversation_agent: ConversationAgent | None = None
+
+
+def _get_conversation_agent() -> ConversationAgent:
+    global _conversation_agent
+    if _conversation_agent is None:
+        _conversation_agent = ConversationAgent(_get_pipeline()._vector_store, _get_multi_rag())
+    return _conversation_agent
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# UNIFIED ASK (documents + videos + webpages) – WITH CONVERSATION MEMORY AND STATE
 # ══════════════════════════════════════════════════════════════════════════════
 @app.post("/ask")
 async def ask(req: AskRequest):
     """
     UNIFIED answer from all sources: documents, videos, and webpages.
-    Supports conversation memory via session_id.
+    Supports conversation memory via session_id AND stateful multi-turn recommendations.
     """
     if not req.question.strip():
         raise HTTPException(status_code=400, detail="Question cannot be empty.")
-    
+
     # Retrieve or create conversation history for this session
     history_list = _conversations.get(req.session_id, [])
-    # Format history as a string for the prompt
     history_str = ""
-    for turn in history_list[-_MAX_HISTORY_TURNS * 2:]:  # last N turns
+    for turn in history_list[-_MAX_HISTORY_TURNS * 2 :]:
         history_str += f"{turn['role'].capitalize()}: {turn['content']}\n"
-    
+
+    agent = _get_conversation_agent()
     try:
-        answer, sources = await _get_multi_rag().ask(req.question, history=history_str)
-        
+        result, is_complete = await agent.process_message(req.session_id, req.question, history_str)
+
+        answer = result.get("message", "")
+        options = result.get("options", [])  # list of {id, label, description, recommended}
+
         # Update conversation memory
         history_list.append({"role": "user", "content": req.question})
         history_list.append({"role": "assistant", "content": answer})
-        _conversations[req.session_id] = history_list[-_MAX_HISTORY_TURNS * 2:]  # keep only recent
-        
-        return {"answer": answer, "sources": sources}
+        _conversations[req.session_id] = history_list[-_MAX_HISTORY_TURNS * 2 :]
+
+        return {
+            "answer": answer,
+            "options": options,
+            "sources": [],
+            "conversation_continues": not is_complete,
+        }
     except Exception as exc:
-        logger.exception("Unified ask failed")
+        logger.exception("Conversational ask failed")
         raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.post("/conversation/reset/{session_id}")
+async def reset_conversation(session_id: str):
+    """Reset the conversational agent's state for a session (clears pending questions)."""
+    agent = _get_conversation_agent()
+    agent.reset_session(session_id)
+    # Also clear the stored conversation history if desired
+    if session_id in _conversations:
+        del _conversations[session_id]
+    return {"status": "reset"}
+
 
 @app.delete("/conversation/{session_id}")
 async def clear_conversation(session_id: str):
+    """Clear conversation history (legacy endpoint)."""
     if session_id in _conversations:
         del _conversations[session_id]
+    # Also reset agent state
+    _get_conversation_agent().reset_session(session_id)
     return {"status": "cleared"}
+
 
 # ── Original document‑only ask (backward compatibility) ──────────────────────
 @app.post("/ask-documents-only")
@@ -293,6 +362,7 @@ async def ask_documents_only(req: AskRequest):
     except Exception as exc:
         logger.exception("Ask failed unexpectedly")
         raise HTTPException(status_code=500, detail=f"The backend failed while generating the answer: {exc}") from exc
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # ALL ORIGINAL ENDPOINTS REMAIN UNCHANGED BELOW
@@ -332,12 +402,14 @@ async def upload(file: UploadFile = File(...)):
     asyncio.create_task(_process())
     return {"job_id": job_id, "filename": filename, "status": "queued"}
 
+
 @app.get("/upload/{job_id}")
 async def upload_status(job_id: str):
     job = _jobs.get(job_id)
     if not job:
         raise HTTPException(status_code=404, detail="Job not found.")
     return job
+
 
 # ── Ingest URL (async) ────────────────────────────────────────────────────────
 @app.post("/ingest-url")
@@ -362,10 +434,12 @@ async def ingest_url(req: URLRequest):
     asyncio.create_task(_process())
     return {"job_id": job_id, "url": url, "status": "queued"}
 
+
 # ── Ask with URL (ultra‑fast) ────────────────────────────────────────────────
 class AskURLRequest(BaseModel):
     url: str
     question: str
+
 
 async def fetch_url_text_async(url: str, max_chars: int = 1500) -> str:
     try:
@@ -380,6 +454,7 @@ async def fetch_url_text_async(url: str, max_chars: int = 1500) -> str:
     except Exception as e:
         logger.error(f"URL fetch error: {e}")
         return ""
+
 
 @app.post("/ask-url")
 async def ask_url(req: AskURLRequest):
@@ -399,6 +474,7 @@ async def ask_url(req: AskURLRequest):
         from router import VLLM_HOST, VLLM_MODEL
         from langchain_openai import ChatOpenAI
         from langchain_core.messages import HumanMessage
+
         llm = ChatOpenAI(
             model=VLLM_MODEL,
             base_url=f"{VLLM_HOST}/v1",
@@ -421,6 +497,7 @@ async def ask_url(req: AskURLRequest):
 
     return StreamingResponse(generate(), media_type="text/event-stream")
 
+
 # ── Streaming ask endpoint (documents only, unchanged) ────────────────────────
 @app.post("/ask-stream")
 async def ask_stream(req: AskRequest):
@@ -439,6 +516,7 @@ async def ask_stream(req: AskRequest):
 
     return StreamingResponse(generate(), media_type="text/plain")
 
+
 # ── Docs management ───────────────────────────────────────────────────────────
 @app.get("/docs")
 async def list_docs():
@@ -456,10 +534,12 @@ async def list_docs():
     documents = [f"{s} ({counts.get(s, 0)} chunks)" for s in sources]
     return {"documents": documents}
 
+
 @app.delete("/docs")
 async def clear_docs():
     await asyncio.to_thread(_get_pipeline().clear_documents)
     return {"status": "cleared"}
+
 
 @app.delete("/docs/{name:path}")
 async def remove_doc(name: str):
@@ -470,19 +550,23 @@ async def remove_doc(name: str):
         raise HTTPException(status_code=404, detail=f"Document '{name}' not found.")
     return {"removed": True, "filename": name}
 
+
 # ── Voice transcription (Whisper) – unchanged ────────────────────────────────
 _whisper_lib = None
 _whisper_model = None
 _whisper_lock = asyncio.Lock()
+
 
 def _import_whisper():
     global _whisper_lib
     if _whisper_lib is None:
         try:
             import whisper as _w
+
             _whisper_lib = _w
         except ImportError:
             raise RuntimeError("openai-whisper is not installed. Run: pip install openai-whisper")
+
 
 def _load_whisper() -> None:
     global _whisper_model
@@ -491,12 +575,14 @@ def _load_whisper() -> None:
     _whisper_model = _whisper_lib.load_model("base")
     logger.info("Whisper model loaded.")
 
+
 async def _get_whisper():
     global _whisper_model
     async with _whisper_lock:
         if _whisper_model is None:
             await asyncio.to_thread(_load_whisper)
     return _whisper_model
+
 
 @app.post("/transcribe")
 async def transcribe_audio(file: UploadFile = File(...)):
@@ -522,6 +608,7 @@ async def transcribe_audio(file: UploadFile = File(...)):
     finally:
         if os.path.exists(tmp_path):
             os.unlink(tmp_path)
+
 
 # ── Health ────────────────────────────────────────────────────────────────────
 @app.get("/health")
