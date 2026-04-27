@@ -10,17 +10,19 @@ from typing import List, Tuple, Optional
 
 def _strip_model_preamble(text: str) -> str:
     """Remove auto-generated meta-commentary lines the LLM prepends to answers."""
+    # Remove 🤖 emoji regardless of encoding variant
+    text = re.sub(r'[\U0001F916\U0001F�️]*\U0001F916[️]?', '', text)
+    text = re.sub(r'^\s*🤖\s*', '', text, flags=re.MULTILINE)
     _TEXT_STARTS = (
         "response was brief",
         "no specific values or formulas",
         "no further action was needed",
     )
     lines = text.split("\n")
-    clean = [
-        l for l in lines
-        if "\U0001f916" not in l  # remove any line containing 🤖
-        and not any(l.strip().lower().startswith(p) for p in _TEXT_STARTS)
-    ]
+    clean = [l for l in lines if not any(l.strip().lower().startswith(p) for p in _TEXT_STARTS)]
+    # Remove leading blank lines
+    while clean and not clean[0].strip():
+        clean.pop(0)
     return "\n".join(clean).strip()
 
 from langchain_core.documents import Document
