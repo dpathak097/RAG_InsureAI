@@ -10,9 +10,8 @@ from typing import List, Tuple, Optional
 
 def _strip_model_preamble(text: str) -> str:
     """Remove auto-generated meta-commentary lines the LLM prepends to answers."""
-    # Remove 🤖 emoji regardless of encoding variant
-    text = re.sub(r'[\U0001F916\U0001F�️]*\U0001F916[️]?', '', text)
-    text = re.sub(r'^\s*🤖\s*', '', text, flags=re.MULTILINE)
+    # Use simple string replace to strip robot emoji — avoids regex encoding issues
+    text = text.replace('\U0001F916', '').replace('\U0001f916', '')
     _TEXT_STARTS = (
         "response was brief",
         "no specific values or formulas",
