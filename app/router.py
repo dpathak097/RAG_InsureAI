@@ -13,7 +13,7 @@ def get_insurance_llm(temperature: float = 0) -> ChatOpenAI:
         base_url=f"{VLLM_HOST}/v1",
         api_key="EMPTY",
         temperature=temperature,
-        max_tokens=512,
+        max_tokens=1024,
         timeout=120,
         max_retries=2,
     )
@@ -24,7 +24,7 @@ def get_general_llm(temperature: float = 0.3) -> ChatOpenAI:
         base_url=f"{VLLM_HOST}/v1",
         api_key="EMPTY",
         temperature=temperature,
-        max_tokens=512,
+        max_tokens=1024,
         timeout=120,
         max_retries=2,
     )
