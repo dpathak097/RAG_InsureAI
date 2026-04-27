@@ -4,7 +4,21 @@ Supports document filtering with substring matching.
 """
 import asyncio
 import logging
+import re
 from typing import List, Tuple, Optional
+
+
+def _strip_model_preamble(text: str) -> str:
+    """Remove auto-generated meta-commentary lines the LLM prepends to answers."""
+    skip_patterns = [
+        r"^🤖",
+        r"^response was brief",
+        r"^no specific values or formulas",
+        r"^no further action was needed",
+    ]
+    lines = text.split("\n")
+    clean = [l for l in lines if not any(re.match(p, l.strip(), re.IGNORECASE) for p in skip_patterns)]
+    return "\n".join(clean).strip()
 
 from langchain_core.documents import Document
 from rag import RAGPipeline
@@ -92,7 +106,7 @@ class MultiSourceRAG:
             llm = get_insurance_llm(temperature=0)
             response = await asyncio.to_thread(llm.invoke, prompt)
             answer = response.content if hasattr(response, "content") else str(response)
-            return answer, list(dict.fromkeys(sources))
+            return _strip_model_preamble(answer), list(dict.fromkeys(sources))
 
         if not full_context.strip():
             # No documents at all — use general knowledge
@@ -104,7 +118,7 @@ class MultiSourceRAG:
             llm = get_insurance_llm(temperature=0.3)
             response = await asyncio.to_thread(llm.invoke, prompt)
             answer = response.content if hasattr(response, "content") else str(response)
-            return answer, []
+            return _strip_model_preamble(answer), []
 
         # ── Prompt selection ──────────────────────────────────────────────────
         # STRICT grounding only when the user is asking about a specific uploaded
@@ -121,7 +135,7 @@ class MultiSourceRAG:
 
         response = await asyncio.to_thread(llm.invoke, prompt)
         answer = response.content if hasattr(response, "content") else str(response)
-        return answer, list(dict.fromkeys(sources))
+        return _strip_model_preamble(answer), list(dict.fromkeys(sources))
 
     # Management methods (keep as before)
     def video_exists(self, url: str) -> bool:

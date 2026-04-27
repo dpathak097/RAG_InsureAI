@@ -382,7 +382,8 @@ class ConversationAgent:
         )
         llm = get_insurance_llm(temperature=0.3)
         response = await asyncio.to_thread(llm.invoke, prompt)
-        return response.content if hasattr(response, "content") else str(response)
+        from multi_source_rag import _strip_model_preamble
+        return _strip_model_preamble(response.content if hasattr(response, "content") else str(response))
 
     def reset_session(self, session_id: str) -> None:
         if session_id in self.sessions:
