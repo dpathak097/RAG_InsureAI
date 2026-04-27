@@ -8,17 +8,25 @@ from typing import Tuple, Optional
 
 logger = logging.getLogger(__name__)
 
-# Keywords that indicate a calculation is required
-CALC_KEYWORDS = [
-    "per thousand", "per hundred", "per unit", "per hour", "per day", "per block",
-    "percentage", "discount", "rate", "limit", "cap", "deductible", "excess",
-    "total", "sum", "difference", "calculate", "how much", "what is the",
-    "maximum", "minimum", "claim", "compensation", "benefit"
+# Phrases that unambiguously require a numeric calculation
+_EXPLICIT_CALC_KEYWORDS = [
+    "per thousand", "per hundred", "per unit",
+    "per hour", "per day", "per block",
+    "percentage", "discount", "deductible", "excess",
+    "calculate",
 ]
 
 def _is_calculation_question(question: str) -> bool:
     q = question.lower()
-    return any(kw in q for kw in CALC_KEYWORDS)
+    # Must contain an actual number to be a real calculation question
+    has_number = bool(re.search(r'\b\d+\b', q))
+    # Explicit math phrases — always a calculation regardless of numbers
+    if any(kw in q for kw in _EXPLICIT_CALC_KEYWORDS):
+        return True
+    # "how much" only counts as calculation when paired with a specific number
+    if "how much" in q and has_number:
+        return True
+    return False
 
 def _extract_numbers(text: str) -> list[float]:
     """Extract all numbers (including decimals) from text."""
