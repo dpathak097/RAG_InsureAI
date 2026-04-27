@@ -10,14 +10,14 @@ from typing import List, Tuple, Optional
 
 def _strip_model_preamble(text: str) -> str:
     """Remove auto-generated meta-commentary lines the LLM prepends to answers."""
-    skip_patterns = [
-        r"^🤖",
-        r"^response was brief",
-        r"^no specific values or formulas",
-        r"^no further action was needed",
-    ]
+    _PREAMBLE_STARTS = (
+        "🤖",
+        "response was brief",
+        "no specific values or formulas",
+        "no further action was needed",
+    )
     lines = text.split("\n")
-    clean = [l for l in lines if not any(re.match(p, l.strip(), re.IGNORECASE) for p in skip_patterns)]
+    clean = [l for l in lines if not any(l.strip().lower().startswith(p) for p in _PREAMBLE_STARTS)]
     return "\n".join(clean).strip()
 
 from langchain_core.documents import Document
