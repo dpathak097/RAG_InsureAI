@@ -93,7 +93,8 @@ class VideoVectorStore:
         ids = results["ids"]
         if ids:
             self.collection.delete(ids=ids)
-            self._rebuild_bm25_flag = True
+            self._rebuild_bm25()   # rebuild immediately so stale chunks aren't returned
+            self._rebuild_bm25_flag = False
             logger.info("Deleted %d chunks for video %s", len(ids), url)
 
     def url_exists(self, url: str) -> bool:
