@@ -374,7 +374,7 @@ class ConversationAgent:
         from rag import _build_structured_context
         from prompt_template import CONVERSATIONAL_RAG_PROMPT
         from router import get_insurance_llm
-        context = _build_structured_context(chunks, max_chars=6000)
+        context = _build_structured_context(chunks, max_chars=2000)
         prompt = CONVERSATIONAL_RAG_PROMPT.format(
             history="",
             context=context,

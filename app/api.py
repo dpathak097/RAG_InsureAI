@@ -48,7 +48,7 @@ _JOB_TTL = 3600  # seconds — jobs older than this are pruned from memory
 
 # Conversation memory: session_id -> list of {"role": "user/assistant", "content": "..."}
 _conversations: dict[str, list[dict]] = {}
-_MAX_HISTORY_TURNS = 10  # keep last 10 exchanges
+_MAX_HISTORY_TURNS = 3  # keep last 3 exchanges to stay within token limit
 
 
 @asynccontextmanager
