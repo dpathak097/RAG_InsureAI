@@ -39,7 +39,7 @@ class MultiSourceRAG:
         self.doc_pipeline = RAGPipeline()
         self.video_store = VideoVectorStore()
         self.webpage_store = WebpageVectorStore()
-        self.max_context_chars = 2000
+        self.max_context_chars = 3500
 
     def _merge_chunks(self, chunks: List[Document]) -> List[Document]:
         seen = {}
@@ -59,16 +59,16 @@ class MultiSourceRAG:
 
         doc_chunks = await asyncio.to_thread(
             self.doc_pipeline._vector_store.search,
-            question, top_k=5, use_hybrid=True, use_reranker=True,
+            question, top_k=6, use_hybrid=True, use_reranker=True,
             filter_metadata=filter_meta
         )
 
         if not document_filter:
             video_chunks = await asyncio.to_thread(
-                self.video_store.search, question, top_k=3, use_hybrid=True, use_reranker=True
+                self.video_store.search, question, top_k=4, use_hybrid=True, use_reranker=True
             )
             webpage_chunks = await asyncio.to_thread(
-                self.webpage_store.search, question, top_k=3, use_hybrid=True, use_reranker=True
+                self.webpage_store.search, question, top_k=4, use_hybrid=True, use_reranker=True
             )
             all_chunks = self._merge_chunks(doc_chunks + video_chunks + webpage_chunks)
         else:
